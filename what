@@ -1,0 +1,801 @@
+return function(Window, player, QuestTab, config)
+	local enableNoclip = config.enableNoclip
+	local disableNoclip = config.disableNoclip
+
+	local RunService = game:GetService("RunService")
+	local Players = game:GetService("Players")
+	local TweenService = game:GetService("TweenService")
+	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local HttpService = game:GetService("HttpService")
+	local Stats = game:GetService("Stats")
+	local UserInputService = game:GetService("UserInputService")
+	local PhysicsService = game:GetService("PhysicsService")
+	local MarketplaceService = game:GetService("MarketplaceService")
+	local TeleportService = game:GetService("TeleportService")
+
+	local PlayerStats = player:WaitForChild("PlayerStats")
+	local PlayerLevel = PlayerStats:WaitForChild("Level")
+	local PlayerPity = PlayerStats:WaitForChild("PityCount")
+	local PlayerStand = PlayerStats:WaitForChild("Stand")
+	local PlayerPrestige = PlayerStats:WaitForChild("Prestige")
+	local PlayerSpec = PlayerStats:WaitForChild("Spec")
+	local PlayerMoney = PlayerStats:WaitForChild("Money")
+	local ClientFX = ReplicatedStorage:WaitForChild("ClientFX")
+	local Dialogues = workspace:WaitForChild("Dialogues")
+
+	local function GetPlayer()
+		return game.Players.LocalPlayer
+	end
+
+	local function GetCharacter()
+		return GetPlayer().Character or GetPlayer().CharacterAdded:Wait()
+	end
+
+	local function GetHRP()
+		local Character = GetCharacter()
+		return Character and Character:FindFirstChild("HumanoidRootPart")
+	end
+
+	local function EldiabloIsMobile()
+		if rawget(_G, "mobile_ui") then return true end
+		if type(shared) == "table" and rawget(shared, "mobile_ui") then return true end
+		if getgenv then
+			local ok, g = pcall(getgenv)
+			if ok and type(g) == "table" and (rawget(g, "mobile_ui") or rawget(g, "Eldiablo_Mobile")) then
+				return true
+			end
+		end
+		return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+	end
+
+	local function farmEnsureNoclip(char)
+		if not char then return end
+		for _, v in pairs(char:GetDescendants()) do
+			if v:IsA("BasePart") then
+				v.CanCollide = false
+			end
+		end
+		char.DescendantAdded:Connect(function(v)
+			if v:IsA("BasePart") then
+				v.CanCollide = false
+			end
+		end)
+	end
+
+	local function farmThrottledHeartbeat(fn, fpsMobile, fpsDesktop)
+		fpsMobile = fpsMobile or 20
+		fpsDesktop = fpsDesktop or 45
+		local interval = 1 / (EldiabloIsMobile() and fpsMobile or fpsDesktop)
+		local accum = 0
+		return RunService.Heartbeat:Connect(function(dt)
+			accum = accum + dt
+			if accum < interval then return end
+			accum = accum - interval
+			fn(dt)
+		end)
+	end
+
+	local function farmStepWait(default)
+		default = default or 0
+		return EldiabloIsMobile() and math.max(default, 0.06) or default
+	end
+
+	local function notify(title, msg, duration, kind)
+		pcall(function()
+			if Window and Window.Notify then
+				Window:Notify(title, msg, type(duration) == "number" and duration or 4)
+			end
+		end)
+	end
+
+	local function clearFocusCam(char)
+		if not char then return end
+		pcall(function()
+			local fc = char:FindFirstChild("FocusCam")
+			if fc then
+				fc:Destroy()
+			end
+		end)
+	end
+
+	local STAND_KEEPALIVE_EXCLUDED = {
+		["Beach Boy"] = true,
+		["Hermit Purple"] = true,
+		["Mr. President"] = true,
+		["Sex Pistols"] = true,
+		["Anubis"] = true,
+		["None"] = true,
+	}
+
+	local FarmConfig = {
+		KillLoopDelay = 0,
+		Distance = -28,
+	}
+
+	local FarmState = {
+		Active = false,
+		CurrentQuest = nil,
+		CompletedQuest = false,
+		OriginalCFrame = nil,
+	}
+
+	local FarmUtil = {}
+	FarmUtil.CurrentEnemy = nil
+
+	function FarmUtil.GetCharacter()
+		return Players.LocalPlayer.Character or Players.LocalPlayer.CharacterAdded:Wait()
+	end
+
+	function FarmUtil.GetHRP()
+		local char = FarmUtil.GetCharacter()
+		return char and char:FindFirstChild("HumanoidRootPart")
+	end
+
+	local function isHandheldMethod()
+		local m = FarmConfig.FarmingMethod
+		if type(m) == "table" then m = m[1] end
+		if m == "Handheld/Fist" then
+			return true
+		end
+		if m == "Auto" or m == "Auto (Detect)" then
+			return STAND_KEEPALIVE_EXCLUDED[Players.LocalPlayer.PlayerStats.Stand.Value] == true
+		end
+		return false
+	end
+
+	function FarmUtil.EquipStand()
+		local char = FarmUtil.GetCharacter()
+		if not char then return false end
+		if isHandheldMethod() then
+			if char:FindFirstChildWhichIsA("Tool") then
+				return true
+			end
+			local rf = char:FindFirstChild("RemoteFunction")
+			if rf then
+				pcall(function()
+					rf:InvokeServer("ToggleStand", "Toggle")
+				end)
+				task.wait(0.25)
+				return char:FindFirstChildWhichIsA("Tool") ~= nil
+			end
+			return true
+		end
+		local ss = char:FindFirstChild("SummonedStand")
+		if ss and ss.Value then
+			return true
+		end
+		local rf = char:FindFirstChild("RemoteFunction")
+		if rf then
+			pcall(function()
+				rf:InvokeServer("ToggleStand", "Toggle")
+			end)
+			task.wait(0.25)
+			ss = char:FindFirstChild("SummonedStand")
+			return ss and ss.Value
+		end
+		return false
+	end
+
+	function FarmUtil.UseMove(move)
+		local char = FarmUtil.GetCharacter()
+		if char and char:FindFirstChild("RemoteEvent") then
+			pcall(function()
+				char.RemoteEvent:FireServer("Attack", move)
+			end)
+		end
+	end
+
+	local function questEnemyNameMatches(instName, questEnemy)
+		if instName == questEnemy then
+			return true
+		end
+		if questEnemy == "Heaven Ascension Dio" then
+			local n = string.lower(instName or "")
+			if n:find("heaven", 1, true) and n:find("dio", 1, true) then
+				if n:find("ascension", 1, true) or n:find("ascended", 1, true) then
+					return true
+				end
+			end
+		end
+		return false
+	end
+
+	local NPC_KILL_POST_BUFFER_SEC = 1
+
+	local function findAliveQuestEnemy(enemyName)
+		if not enemyName or enemyName == "" then return nil end
+		local function consider(inst)
+			if not inst or not inst.Parent then return nil end
+			if not questEnemyNameMatches(inst.Name, enemyName) then return nil end
+			local h = inst:FindFirstChild("Health")
+			local hrp = inst:FindFirstChild("HumanoidRootPart")
+			if h and hrp and h.Value > 0 then
+				return inst
+			end
+			return nil
+		end
+		local living = workspace:FindFirstChild("Living")
+		if living then
+			for _, child in ipairs(living:GetChildren()) do
+				local e = consider(child)
+				if e then return e end
+			end
+			for _, child in ipairs(living:GetDescendants()) do
+				if child ~= living and child.Parent ~= living then
+					local e = consider(child)
+					if e then return e end
+				end
+			end
+		end
+		local mob2 = workspace:FindFirstChild("Mob_Spawns2")
+		if mob2 then
+			for _, child in ipairs(mob2:GetDescendants()) do
+				local e = consider(child)
+				if e then return e end
+			end
+		end
+		return nil
+	end
+
+	function FarmUtil.Kill(enemy)
+		if not enemy or not enemy.Parent then return end
+		local enemyHRP = enemy:FindFirstChild("HumanoidRootPart")
+		local enemyHealth = enemy:FindFirstChild("Health")
+		if not (enemyHRP and enemyHealth and enemyHealth.Value > 0) then return end
+		local hrp = FarmUtil.GetHRP()
+		if not hrp then return end
+
+		FarmUtil.CurrentEnemy = enemy
+		local moneyConn
+
+		local okKill = pcall(function()
+			local handheld = isHandheldMethod()
+			local lp = Players.LocalPlayer
+			local questProgressAdvanced = false
+
+			if lp.PlayerGui:FindFirstChild("HUD") then
+				local dropMoney = lp.PlayerGui.HUD:FindFirstChild("Main") and lp.PlayerGui.HUD.Main:FindFirstChild("DropMoney")
+				dropMoney = dropMoney and dropMoney:FindFirstChild("Money")
+				if dropMoney then
+					moneyConn = dropMoney.ChildAdded:Connect(function(child)
+						if tonumber(string.match(child.Name, "%d+")) then
+							questProgressAdvanced = true
+						end
+					end)
+				end
+			end
+
+			if not handheld then
+				FarmUtil.EquipStand()
+				local standWaitTimeout = tick() + 4
+				repeat task.wait(0.05) until (FarmUtil.GetCharacter():FindFirstChild("SummonedStand") and FarmUtil.GetCharacter():FindFirstChild("SummonedStand").Value) or tick() > standWaitTimeout
+				task.wait(0.1)
+			end
+
+			local lastEnemyPos = nil
+			while FarmState.Active and not FarmState.CompletedQuest do
+				if enemy.Parent == nil or not enemy:FindFirstChild("HumanoidRootPart") then
+					break
+				end
+				local currentEnemyHRP = enemy:FindFirstChild("HumanoidRootPart")
+				if currentEnemyHRP then
+					lastEnemyPos = currentEnemyHRP.Position
+				end
+				local h = enemy:FindFirstChild("Health")
+				if h and h.Value <= 0 then
+					break
+				end
+				if questProgressAdvanced then
+					break
+				end
+				local char = Players.LocalPlayer.Character
+				local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+				if hum and hum.Health > 0 then
+					if handheld or char:FindFirstChild("StandMorph") then
+						FarmUtil.UseMove("m1")
+						local remote = char:FindFirstChild("RemoteEvent")
+						if remote then
+							if game:GetService("CollectionService"):HasTag(enemy, "Blocking") then
+								remote:FireServer("InputBegan", { Input = Enum.KeyCode.R })
+							end
+							local keys = getgenv().AutoUseStandSkillKeys or {"E"}
+							for _, keyName in ipairs(keys) do
+								local skillKey = keyName and Enum.KeyCode[keyName] or nil
+								if skillKey then
+									remote:FireServer("InputBegan", { Input = skillKey })
+								end
+							end
+						end
+					else
+						task.wait(0.3)
+					end
+				else
+					Players.LocalPlayer.CharacterAdded:Wait()
+					if not handheld then
+						FarmUtil.EquipStand()
+					end
+					task.wait(0.3)
+				end
+				local kd = FarmConfig.KillLoopDelay
+				if type(kd) == "number" and kd > 0 then
+					task.wait(math.min(kd, 2))
+				else
+					task.wait()
+				end
+			end
+			if lastEnemyPos then
+				local hrp = FarmUtil.GetHRP()
+				if hrp then
+					hrp.CFrame = CFrame.new(lastEnemyPos + Vector3.new(0, 8, 0))
+				end
+			end
+		end)
+
+		if moneyConn then
+			pcall(function() moneyConn:Disconnect() end)
+			moneyConn = nil
+		end
+
+		local bufUntil = tick() + NPC_KILL_POST_BUFFER_SEC
+		while FarmState.Active and tick() < bufUntil do
+			local char = Players.LocalPlayer.Character
+			local hum = char and char:FindFirstChildWhichIsA("Humanoid")
+			if hum and hum.Health > 0 then
+				if isHandheldMethod() or (char and char:FindFirstChild("StandMorph")) then
+					FarmUtil.UseMove("m1")
+					local remote = char:FindFirstChild("RemoteEvent")
+					if remote then
+						local keys = getgenv().AutoUseStandSkillKeys or {"E"}
+						for _, keyName in ipairs(keys) do
+							local skillKey = keyName and Enum.KeyCode[keyName] or nil
+							if skillKey then
+								remote:FireServer("InputBegan", { Input = skillKey })
+							end
+						end
+					end
+				else
+					task.wait(0.3)
+				end
+			end
+			local kd = FarmConfig.KillLoopDelay
+			if type(kd) == "number" and kd > 0 then
+				task.wait(math.min(kd, 2))
+			else
+				task.wait()
+			end
+		end
+
+		clearFocusCam(Players.LocalPlayer.Character)
+
+		local safeHRP = FarmUtil.GetHRP()
+		if safeHRP then
+			safeHRP.AssemblyLinearVelocity = Vector3.zero
+			safeHRP.AssemblyAngularVelocity = Vector3.zero
+		end
+
+		FarmUtil.CurrentEnemy = nil
+	end
+
+		local function getQuestState()
+		local plr = Players.LocalPlayer
+		if not plr or not plr:FindFirstChild("PlayerStats") then
+			return "none", nil, 0, 0
+		end
+		local currentQuest = plr.PlayerStats:FindFirstChild("CurrentQuest")
+		local questProgress = plr.PlayerStats:FindFirstChild("QuestProgress")
+		local questMax = plr.PlayerStats:FindFirstChild("QuestMaxProgress")
+		if currentQuest and currentQuest.Value ~= "" and questProgress and questMax then
+			local progress = questProgress.Value or 0
+			local maxProgress = questMax.Value or 0
+			if maxProgress > 0 and progress >= maxProgress then
+				return "complete", currentQuest.Value, progress, maxProgress
+			end
+			return "active", currentQuest.Value, progress, maxProgress
+		end
+		return "none", nil, 0, 0
+	end
+
+	local function isQuestComplete()
+		local state, _, progress, maxProgress = getQuestState()
+		if state == "complete" then return true end
+		if state == "active" and maxProgress > 0 and progress >= maxProgress then
+			return true
+		end
+		return false
+	end
+
+	local function hasActiveQuest()
+		local state = getQuestState()
+		return state == "active"
+	end
+
+	local function getCurrentQuestName()
+		local plr = Players.LocalPlayer
+		if plr and plr:FindFirstChild("PlayerStats") then
+			local cq = plr.PlayerStats:FindFirstChild("CurrentQuest")
+			if cq and cq.Value ~= "" then
+				return cq.Value
+			end
+		end
+		return nil
+	end
+
+	local ZEPPELI_NPC_NAME = "William Zeppeli [Lvl. 25+]"
+	local ZEPPELI_DIALOGUE_NAME = "William Zeppeli"
+
+	local function getQuestFromWilliamZeppeli()
+		local plr = Players.LocalPlayer
+		local state = getQuestState()
+		if state == "active" or state == "complete" then
+			return true
+		end
+
+		local char = GetCharacter()
+		if not char then return false end
+		local Event = char:FindFirstChild("RemoteEvent")
+		if not Event then return false end
+
+		-- EXACT same pattern as DIO [Lvl. 35+] handler
+		pcall(function()
+			Event:FireServer("PromptTriggered", game:GetService("ReplicatedStorage"):WaitForChild("Dialogue"):WaitForChild(ZEPPELI_DIALOGUE_NAME))
+		end)
+
+		local dlgStart = tick()
+		repeat
+			task.wait(0.1)
+		until plr.PlayerGui:FindFirstChild("DialogueGui") or tick() - dlgStart > 3
+
+		local zepDlgStart = tick()
+		while plr.PlayerGui:FindFirstChild("DialogueGui") and tick() - zepDlgStart < 6 do
+			pcall(function()
+				local dg = plr.PlayerGui.DialogueGui
+				local frame = dg:FindFirstChild("Frame")
+				if not frame then return end
+				local cc = frame:FindFirstChild("ClickContinue")
+				if cc then
+					for _, conn in pairs(getconnections(cc.MouseButton1Click)) do
+						conn:Fire()
+					end
+				end
+				local opts = frame:FindFirstChild("Options")
+				if opts then
+					for i = 1, 4 do
+						local opt = opts:FindFirstChild("Option" .. tostring(i))
+						if opt then
+							local tb = opt:FindFirstChild("TextButton")
+							if tb then
+								for _, conn in pairs(getconnections(tb.MouseButton1Click)) do
+									conn:Fire()
+								end
+							end
+						end
+					end
+				end
+			end)
+			task.wait(0.15)
+		end
+
+		for dNum = 1, 8 do
+			for oNum = 1, 3 do
+				pcall(function()
+					Event:FireServer("EndDialogue", {
+						["NPC"] = ZEPPELI_DIALOGUE_NAME,
+						["Option"] = "Option" .. tostring(oNum),
+						["Dialogue"] = "Dialogue" .. tostring(dNum)
+					})
+				end)
+			end
+		end
+
+		getgenv().CompletedQuest = false
+		FarmState.CompletedQuest = false
+		return true
+	end
+
+	local function turnInQuestToWilliamZeppeli()
+		local plr = Players.LocalPlayer
+		local state = getQuestState()
+		if state ~= "complete" then
+			return false
+		end
+
+		local char = GetCharacter()
+		if not char then return false end
+		local Event = char:FindFirstChild("RemoteEvent")
+		if not Event then return false end
+
+		-- EXACT same pattern as DIO [Lvl. 35+] turn-in handler
+		pcall(function()
+			Event:FireServer("PromptTriggered", game:GetService("ReplicatedStorage"):WaitForChild("Dialogue"):WaitForChild(ZEPPELI_DIALOGUE_NAME))
+		end)
+
+		local dlgStart = tick()
+		repeat
+			task.wait(0.1)
+		until plr.PlayerGui:FindFirstChild("DialogueGui") or tick() - dlgStart > 3
+
+		local zepDlgStart = tick()
+		while plr.PlayerGui:FindFirstChild("DialogueGui") and tick() - zepDlgStart < 6 do
+			pcall(function()
+				local dg = plr.PlayerGui.DialogueGui
+				local frame = dg:FindFirstChild("Frame")
+				if not frame then return end
+				local cc = frame:FindFirstChild("ClickContinue")
+				if cc then
+					for _, conn in pairs(getconnections(cc.MouseButton1Click)) do
+						conn:Fire()
+					end
+				end
+				local opts = frame:FindFirstChild("Options")
+				if opts then
+					for i = 1, 4 do
+						local opt = opts:FindFirstChild("Option" .. tostring(i))
+						if opt then
+							local tb = opt:FindFirstChild("TextButton")
+							if tb then
+								for _, conn in pairs(getconnections(tb.MouseButton1Click)) do
+									conn:Fire()
+								end
+							end
+						end
+					end
+				end
+			end)
+			task.wait(0.15)
+		end
+
+		for dNum = 1, 8 do
+			pcall(function()
+				Event:FireServer("EndDialogue", {
+					["NPC"] = ZEPPELI_DIALOGUE_NAME,
+					["Option"] = "Option1",
+					["Dialogue"] = "Dialogue" .. tostring(dNum)
+				})
+			end)
+		end
+
+		task.spawn(function()
+			Window:Notify("Quest", "Fuck yall lazy ass", 2)
+		end)
+		return true
+	end
+
+		local function ZeppeliFarmLoop()
+		local lp = Players.LocalPlayer
+		local questName = "William Zeppeli [Lvl. 25+]"
+		local enemyName = "Vampire"
+
+		-- Detect quest completion via GUI popup
+		local PlayerGui = lp:WaitForChild("PlayerGui")
+		local hud = PlayerGui:FindFirstChild("HUD")
+		local questCompletedConn
+		if hud then
+			questCompletedConn = hud.ChildAdded:Connect(function(child)
+				if child.Name == "QuestCompleted" then
+					FarmState.CompletedQuest = true
+				end
+			end)
+		end
+
+		task.spawn(function()
+			while FarmState.Active do
+				task.wait(3)
+				if not FarmState.Active then break end
+				if isHandheldMethod() and not STAND_KEEPALIVE_EXCLUDED[lp.PlayerStats.Stand.Value] then
+					continue
+				end
+				local char = lp.Character
+				if char then
+					local ss = char:FindFirstChild("SummonedStand")
+					if not (ss and ss.Value) then
+						pcall(FarmUtil.EquipStand)
+					end
+				end
+			end
+		end)
+
+		local masterConn = farmThrottledHeartbeat(function()
+			if not FarmState.Active then return end
+			local char = lp.Character
+			if not char then return end
+			local hHRP = char:FindFirstChild("HumanoidRootPart")
+			if not hHRP then return end
+
+			if isHandheldMethod() then
+				local enemy = FarmUtil.CurrentEnemy
+				if enemy and enemy.Parent then
+					local eHRP = enemy:FindFirstChild("HumanoidRootPart")
+					if eHRP then
+						hHRP.CFrame = eHRP.CFrame
+						hHRP.AssemblyLinearVelocity = Vector3.zero
+					end
+				end
+				return
+			end
+
+			local sm = char:FindFirstChild("StandMorph")
+			if not sm or not sm.PrimaryPart then
+				hHRP.AssemblyLinearVelocity = Vector3.zero
+				hHRP.AssemblyAngularVelocity = Vector3.zero
+				return
+			end
+
+			local enemy = FarmUtil.CurrentEnemy
+			if enemy and enemy.Parent then
+				local eHRP = enemy:FindFirstChild("HumanoidRootPart")
+				if eHRP then
+					sm.PrimaryPart.CFrame = eHRP.CFrame + eHRP.CFrame.LookVector * -1.1
+					sm.PrimaryPart.AssemblyLinearVelocity = Vector3.zero
+					sm.PrimaryPart.AssemblyAngularVelocity = Vector3.zero
+					local hum = char:FindFirstChildWhichIsA("Humanoid")
+					if hum and hum.Health > 0 then
+						hHRP.CFrame = CFrame.new(sm.PrimaryPart.Position + Vector3.new(0, FarmConfig.Distance, 0))
+					end
+					if not char:FindFirstChild("FocusCam") then
+						local fc = Instance.new("ObjectValue", char)
+						fc.Name = "FocusCam"
+						fc.Value = sm.PrimaryPart
+					elseif char.FocusCam.Value ~= sm.PrimaryPart then
+						char.FocusCam.Value = sm.PrimaryPart
+					end
+					return
+				end
+			end
+
+			sm.PrimaryPart.CFrame = hHRP.CFrame + Vector3.new(0, 2, 0)
+			sm.PrimaryPart.AssemblyLinearVelocity = Vector3.zero
+			sm.PrimaryPart.AssemblyAngularVelocity = Vector3.zero
+		end, 22, 45)
+
+		while FarmState.Active do
+			local state, currentQuest, progress, maxProgress = getQuestState()
+
+			if state == "complete" or FarmState.CompletedQuest then
+				-- Stop movement
+				pcall(function()
+					local hrp = FarmUtil.GetHRP()
+					if hrp then
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						hrp.AssemblyAngularVelocity = Vector3.zero
+					end
+				end)
+
+				task.wait(0.2)
+				-- Turn in the completed quest
+				pcall(turnInQuestToWilliamZeppeli)
+				task.wait(0.5)
+
+				-- Wait until quest is actually turned in (state becomes "none")
+				local timeout = tick() + 6
+				while tick() < timeout and FarmState.Active do
+					local s = getQuestState()
+					if s == "none" then break end
+					task.wait(0.25)
+				end
+
+				-- Now get a new quest
+				pcall(getQuestFromWilliamZeppeli)
+				task.wait(0.5)
+
+				-- Wait until we have an active quest
+				timeout = tick() + 6
+				while tick() < timeout and FarmState.Active do
+					local s = getQuestState()
+					if s == "active" or s == "complete" then break end
+					task.wait(0.25)
+				end
+
+				FarmState.CompletedQuest = false
+
+			elseif state == "none" then
+				-- No quest at all, go get one
+				pcall(function()
+					local hrp = FarmUtil.GetHRP()
+					if hrp then
+						hrp.AssemblyLinearVelocity = Vector3.zero
+						hrp.AssemblyAngularVelocity = Vector3.zero
+					end
+				end)
+
+				pcall(getQuestFromWilliamZeppeli)
+				task.wait(0.5)
+
+				-- Wait until we have a quest
+				local timeout = tick() + 6
+				while tick() < timeout and FarmState.Active do
+					local s = getQuestState()
+					if s == "active" or s == "complete" then break end
+					task.wait(0.25)
+				end
+
+			elseif state == "active" then
+				-- We have an active quest, JUST FARM. Don't touch dialogue.
+				local s, cq, prog, maxp = getQuestState()
+				while s == "active" and prog < maxp and FarmState.Active do
+					local enemy = findAliveQuestEnemy(enemyName)
+					if enemy then
+						pcall(function() FarmUtil.Kill(enemy) end)
+						task.wait(0.25)
+					else
+						task.wait(0.15)
+					end
+					s, cq, prog, maxp = getQuestState()
+				end
+
+				-- Check if quest just finished
+				if isQuestComplete() then
+					FarmState.CompletedQuest = true
+				end
+			end
+
+			task.wait(0.5)
+		end
+
+		FarmUtil.CurrentEnemy = nil
+		pcall(function() if masterConn then masterConn:Disconnect() end end)
+		pcall(function() if questCompletedConn then questCompletedConn:Disconnect() end end)
+		clearFocusCam(FarmUtil.GetCharacter())
+		if FarmState.OriginalCFrame then
+			local hrp = FarmUtil.GetHRP()
+			if hrp then pcall(function() hrp.CFrame = FarmState.OriginalCFrame end) end
+			FarmState.OriginalCFrame = nil
+		end
+	end
+local QuestSection = QuestTab:Section("Quest Farm", "Left", "swords")
+
+	getgenv().AutoUseStandSkillKeys = {"E"}
+	getgenv().ZeppeliFarmEnabled = false
+
+	QuestSection:Label("")
+	QuestSection:Label("We sincerely apologize, but the full Quest Farm")
+	QuestSection:Label("system is currently broken due to YBA's recent")
+	QuestSection:Label("dialogue update (71 NPCs reformatted). The")
+	QuestSection:Label("entire farm is being rebuilt from scratch.")
+	QuestSection:Label("")
+	QuestSection:Label("This is a temporary replacement that only")
+	QuestSection:Label("supports William Zeppeli (Vampire) quests")
+	QuestSection:Label("using the confirmed PromptTriggered method.")
+	QuestSection:Label("")
+	QuestSection:Label("Toggle below to auto-farm William Zeppeli.")
+	QuestSection:Label("")
+
+	QuestSection:Toggle("Auto Farm William Zeppeli", false, function(value)
+		if value then
+			if getgenv().normalFarmOn or getgenv().afkFarmOn or getgenv().afkUnderneathFarmOn or getgenv().safePlaceFarmOn then
+				Window:Notify("Quest", "Item Farm is running! Disable it first.", 3)
+				return
+			end
+		end
+
+		getgenv().ZeppeliFarmEnabled = value
+
+		if value then
+			Window:Notify("Quest", "William Zeppeli farm started!", 3)
+			enableNoclip()
+			FarmState.OriginalCFrame = FarmUtil.GetHRP() and FarmUtil.GetHRP().CFrame
+			FarmState.Active = true
+			FarmState.CompletedQuest = false
+			task.spawn(ZeppeliFarmLoop)
+		else
+			FarmState.Active = false
+			FarmState.CompletedQuest = false
+			clearFocusCam(FarmUtil.GetCharacter())
+			if FarmState.OriginalCFrame then
+				local hrp = FarmUtil.GetHRP()
+				if hrp then hrp.CFrame = FarmState.OriginalCFrame end
+				FarmState.OriginalCFrame = nil
+			end
+			Window:Notify("Quest", "William Zeppeli farm stopped!", 3)
+			disableNoclip()
+		end
+	end)
+
+	farmThrottledHeartbeat(function()
+		if not FarmState.Active then return end
+		local char = Players.LocalPlayer.Character
+		if not char then return end
+		farmEnsureNoclip(char)
+	end, 12, 30)
+
+	notify("", "Mob Farm ready.", 4)
+end
